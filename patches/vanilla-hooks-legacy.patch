@@ -1,0 +1,596 @@
+diff --git a/apps/deckcraft-web/index.html b/apps/deckcraft-web/index.html
+index ca570df3..3525af77 100644
+--- a/apps/deckcraft-web/index.html
++++ b/apps/deckcraft-web/index.html
+@@ -7,11 +7,47 @@
+   <link data-trunk rel="rust" data-bin="deckcraft-web" data-wasm-opt="z" data-weak-refs />
+   <link data-trunk rel="icon" href="../../assets/app-icon/deckcraft.ico" />
+   <style>
+-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #262626; }
++    :root, [data-theme="dark"] {
++      --bg-base: #1f1f1f;
++      --bg-panel: #292929;
++      --text-main: #eeeeee;
++      --text-muted: #b0b0b0;
++      --accent: #3b5bdb;
++      --border: #3a3a3a;
++      --aurora-gradient: linear-gradient(135deg, #4facfe 0%, #9b72cb 35%, #d96570 70%, #f3a183 100%);
++      --aurora-subtle-glow: linear-gradient(135deg, rgba(79, 172, 254, 0.15), rgba(155, 114, 203, 0.15), rgba(217, 101, 112, 0.15));
++    }
++    [data-theme="light"] {
++      --bg-base: #f0f0f0;
++      --bg-panel: #ffffff;
++      --text-main: #242424;
++      --text-muted: #616161;
++      --accent: #3b5bdb;
++      --border: #e1e1e1;
++    }
++    [data-theme="aurora"] {
++      --bg-base: #0b0d14;
++      --bg-panel: #131622;
++      --text-main: #e4e6eb;
++      --text-muted: #8b92a5;
++      --accent: #9b72cb;
++      --border: #272c40;
++      --aurora-gradient: linear-gradient(135deg, #4facfe 0%, #9b72cb 35%, #d96570 70%, #f3a183 100%);
++      --aurora-subtle-glow: linear-gradient(135deg, rgba(79, 172, 254, 0.15), rgba(155, 114, 203, 0.15), rgba(217, 101, 112, 0.15));
++    }
++    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg-base, #262626); }
+     #deckcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+     #deckcraft_loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+       color: #b8b8b8; font: 14px system-ui, sans-serif; pointer-events: none; }
+   </style>
++  <script>
++    (function() {
++      try {
++        var theme = localStorage.getItem("artcraft_theme") || "dark";
++        document.documentElement.setAttribute("data-theme", theme);
++      } catch (e) {}
++    })();
++  </script>
+ </head>
+ <body>
+   <canvas id="deckcraft_canvas"></canvas>
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 88b9f770..eb42c667 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -18,6 +18,9 @@ deckcraft-render = { workspace = true }
+ deckcraft-anim = { workspace = true }
+ deckcraft-engine = { workspace = true }
+ deckcraft-media = { workspace = true }
++rfd = { workspace = true }
++chrono = { workspace = true }
++ureq = { version = "3.5", features = ["rustls"] }
+ egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
+ craft-ui = { workspace = true }
+ serde = { workspace = true }
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index 7c9c373a..5ecc1ca0 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -40,12 +40,22 @@ impl SlideApp {
+     pub fn new(session: Session, mut services: Services) -> Self {
+         let audio_out = services.audio_out.take();
+         SlideApp {
++            artcraft_drive: crate::artcraft_drive::ArtCraftDrive::new("DeckCraft", "pptx"),
++            artcraft_agent: crate::artcraft_agent::ArtCraftAgent::new(),
+             last_fill: serde_json::json!("accent1"),
+             last_outline: serde_json::json!("tx1"),
+             table_pen: serde_json::json!({"width": 1.0}),
+             session,
+             services,
+-            ui: UiState::default(),
++            ui: {
++                let global_t = crate::artcraft_theme::AppTheme::load_global();
++                let b = match global_t {
++                    crate::artcraft_theme::AppTheme::Light => theme::Brightness::Light,
++                    crate::artcraft_theme::AppTheme::Aurora => theme::Brightness::Aurora,
++                    crate::artcraft_theme::AppTheme::Dark => theme::Brightness::Dark,
++                };
++                UiState { brightness: b, ..UiState::default() }
++            },
+             textures: textures::Textures::default(),
+             control_rx: None,
+             squiggles: Default::default(),
+@@ -246,6 +256,8 @@ impl SlideApp {
+             }
+         }
+         self.autosave_if_due(ctx);
++        self.poll_artcraft_agent();
++        self.artcraft_autosave_tick();
+         self.tick_media_clock(ctx);
+         self.note_settled_composition(ctx);
+         // In a full run_ui pass the UI callback after this logic half still owns the pass's final
+@@ -308,14 +320,35 @@ impl SlideApp {
+         self.keyboard(&ctx);
+         self.sync_backstage();
+         ribbon::title_bar(self, ui);
++        status::status_bar(self, ui);
+         if self.backstage.is_none() && self.session.active().is_some() {
+             ribbon::show(self, ui);
+-            status::status_bar(self, ui);
+         }
+         let now = ui.input(|i| i.time);
+         if self.tick_anim_preview(now) {
+             ctx.request_repaint();
+         }
++        let doc_summary = self.session.active().map(|d| {
++            let cur_idx = d.selection.slide.min(d.doc.slides.len().saturating_sub(1));
++            let cur_slide_title = d.doc.slides.get(cur_idx).and_then(|s| {
++                s.shapes.iter().find_map(|sh| {
++                    let txt = sh.text.as_ref().map(|tb| tb.paragraphs.iter().map(|p| p.text()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
++                    let trimmed = txt.trim();
++                    if !trimmed.is_empty() { Some(trimmed.lines().next().unwrap_or("").to_string()) } else { None }
++                })
++            }).unwrap_or_else(|| "Unbenannte Folie".into());
++            format!(
++                "Präsentation: {} | Folie {} von {} ({}) | Geändert: {}",
++                d.title(),
++                cur_idx + 1,
++                d.doc.slides.len(),
++                cur_slide_title,
++                d.is_dirty()
++            )
++        }).unwrap_or_else(|| "Startbildschirm (Noch keine Präsentation geöffnet)".into());
++        let proj_dir = self.artcraft_drive.active_project_dir().to_string_lossy().to_string();
++        self.artcraft_agent.render_sidebar(ui, &doc_summary, &proj_dir);
++        self.poll_artcraft_agent();
+         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
+             if self.backstage.is_some() {
+                 // File tab: the Backstage view replaces everything below the title bar.
+@@ -368,3 +401,5 @@ impl SlideApp {
+         self.pending_urls.push(url.to_string());
+     }
+ }
++
++include!("artcraft_mcp.rs");
+diff --git a/crates/ui-egui/src/app/frame.rs b/crates/ui-egui/src/app/frame.rs
+index 0da3896b..39b941bb 100644
+--- a/crates/ui-egui/src/app/frame.rs
++++ b/crates/ui-egui/src/app/frame.rs
+@@ -17,8 +17,12 @@ impl SlideApp {
+             ctx.request_discard("install interface fonts before layout");
+             return false;
+         }
+-        if self.restyle {
+-            theme::apply(ctx, &theme::Tokens::for_brightness(self.ui.brightness));
++        let current_is_aurora = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("is_aurora")).unwrap_or(false));
++        let want_aurora = self.ui.brightness == theme::Brightness::Aurora;
++        let want_dark = self.ui.brightness != theme::Brightness::Light;
++        let is_dark = ctx.global_style().visuals.dark_mode;
++        if self.restyle || current_is_aurora != want_aurora || is_dark != want_dark {
++            theme::apply_brightness(ctx, self.ui.brightness);
+             self.restyle = false;
+         }
+         self.fonts_ready = true;
+diff --git a/crates/ui-egui/src/backstage/files.rs b/crates/ui-egui/src/backstage/files.rs
+index 4b7cec66..53ef66d9 100644
+--- a/crates/ui-egui/src/backstage/files.rs
++++ b/crates/ui-egui/src/backstage/files.rs
+@@ -252,7 +252,7 @@ pub(super) fn home(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage, out: &mu
+         });
+     }
+     ui.add_space(30.0);
+-    ui.hyperlink_to("Join the ArtCraft community on Discord", deckcraft_engine::links::DISCORD);
++    // discord removed
+ }
+ 
+ /// New: a blank presentation, then every theme and starter template, with a search box.
+diff --git a/crates/ui-egui/src/dialogs/about.rs b/crates/ui-egui/src/dialogs/about.rs
+index 03c6629b..d14174b8 100644
+--- a/crates/ui-egui/src/dialogs/about.rs
++++ b/crates/ui-egui/src/dialogs/about.rs
+@@ -26,7 +26,7 @@ pub fn about(_app: &mut SlideApp, ui: &mut Ui) {
+         ui.label("Presentations and slide shows, rebuilt from scratch in pure Rust.");
+         ui.label("An open-source, clean-room project. Not affiliated with Microsoft.");
+         ui.add_space(6.0);
+-        ui.hyperlink_to("Join our community on Discord", deckcraft_engine::links::DISCORD);
++        // discord removed
+         ui.hyperlink_to("getartcraft.com/apps/deckcraft", deckcraft_engine::links::APP_PAGE);
+         ui.hyperlink_to("Source on GitHub", deckcraft_engine::links::GITHUB);
+         ui.add_space(6.0);
+diff --git a/crates/ui-egui/src/dialogs/body.rs b/crates/ui-egui/src/dialogs/body.rs
+index cb1a879e..ae64bb8a 100644
+--- a/crates/ui-egui/src/dialogs/body.rs
++++ b/crates/ui-egui/src/dialogs/body.rs
+@@ -1341,10 +1341,27 @@ fn dlg_preferences(app: &mut SlideApp, ui: &mut Ui, d: &mut Dialog) -> bool {
+         d.params = json!({ "before": preferences_snapshot(app) });
+     }
+     ui.label(egui::RichText::new("General").font(theme::bold(13.0)));
+-    let mut dark = app.ui.brightness == theme::Brightness::Dark;
+-    if ui.checkbox(&mut dark, "Dark appearance").changed() {
+-        let _ = app.run("view.dark", json!({"on": dark}));
+-    }
++    let cur_app_theme = match app.ui.brightness {
++        theme::Brightness::Light => crate::artcraft_theme::AppTheme::Light,
++        theme::Brightness::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++        theme::Brightness::Dark => crate::artcraft_theme::AppTheme::Dark,
++    };
++    ui.horizontal(|ui| {
++        ui.label("Theme:");
++        for t in crate::artcraft_theme::AppTheme::ALL {
++            let is_sel = cur_app_theme == t;
++            if ui.selectable_label(is_sel, t.name()).clicked() {
++                let new_b = match t {
++                    crate::artcraft_theme::AppTheme::Light => theme::Brightness::Light,
++                    crate::artcraft_theme::AppTheme::Aurora => theme::Brightness::Aurora,
++                    crate::artcraft_theme::AppTheme::Dark => theme::Brightness::Dark,
++                };
++                app.ui.brightness = new_b;
++                crate::artcraft_theme::AppTheme::save_global(t);
++            }
++        }
++    });
++    ui.add_space(4.0);
+     // While the pointer holds the slider its value only waits in the dialog: applying it
+     // would rescale the slider under the pointer and run it to an end (#767). It applies
+     // on release, and at once from the keyboard.
+diff --git a/crates/ui-egui/src/dialogs/preferences.rs b/crates/ui-egui/src/dialogs/preferences.rs
+index b0b98fe5..3d13035d 100644
+--- a/crates/ui-egui/src/dialogs/preferences.rs
++++ b/crates/ui-egui/src/dialogs/preferences.rs
+@@ -2,7 +2,13 @@ use super::{Dialog, SlideApp, Value, json, theme};
+ 
+ /// What the Preferences dialog can change, as it was when the dialog opened.
+ pub(super) fn preferences_snapshot(app: &SlideApp) -> Value {
++    let b_str = match app.ui.brightness {
++        theme::Brightness::Light => "light",
++        theme::Brightness::Dark => "dark",
++        theme::Brightness::Aurora => "aurora",
++    };
+     json!({
++        "brightness": b_str,
+         "dark": app.ui.brightness == theme::Brightness::Dark,
+         "uiScale": app.ui.ui_scale,
+         "prefs": serde_json::to_value(&app.session.prefs).unwrap_or(Value::Null),
+@@ -12,7 +18,14 @@ pub(super) fn preferences_snapshot(app: &SlideApp) -> Value {
+ /// Puts back the settings the Preferences dialog opened with (Cancel, Esc, the close button).
+ pub(super) fn restore_preferences(app: &mut SlideApp, d: &Dialog) {
+     let Some(before) = d.params.get("before") else { return };
+-    if let Some(dark) = before.get("dark").and_then(Value::as_bool)
++    if let Some(b) = before.get("brightness").and_then(Value::as_str) {
++        let restored = match b {
++            "light" => theme::Brightness::Light,
++            "aurora" => theme::Brightness::Aurora,
++            _ => theme::Brightness::Dark,
++        };
++        app.ui.brightness = restored;
++    } else if let Some(dark) = before.get("dark").and_then(Value::as_bool)
+         && dark != (app.ui.brightness == theme::Brightness::Dark)
+     {
+         let _ = app.run("view.dark", json!({ "on": dark }));
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index b4e531ba..b12bcac0 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -15,6 +15,9 @@ pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
+     ..craft_update::suite::DECKCRAFT
+ };
+ 
++pub mod artcraft_agent;
++pub mod artcraft_theme;
++pub mod artcraft_drive;
+ pub mod backstage;
+ pub mod canvas;
+ pub mod capture;
+@@ -214,6 +217,8 @@ struct InputTarget {
+ }
+ 
+ pub struct SlideApp {
++    pub artcraft_drive: artcraft_drive::ArtCraftDrive,
++    pub artcraft_agent: artcraft_agent::ArtCraftAgent,
+     /// Shape Fill's last colour (a command colour parameter): the button applies it again. Accent 1 until one is picked.
+     pub last_fill: serde_json::Value,
+     /// Shape Outline's last colour, likewise. Text 1 until one is picked.
+diff --git a/crates/ui-egui/src/ribbon/title_bar.rs b/crates/ui-egui/src/ribbon/title_bar.rs
+index 6c7e825e..c96c52d0 100644
+--- a/crates/ui-egui/src/ribbon/title_bar.rs
++++ b/crates/ui-egui/src/ribbon/title_bar.rs
+@@ -1,6 +1,7 @@
++use egui::{Color32, Stroke};
+ use super::{Align2, Icon, Rect, Sense, SlideApp, Tokens, Ui, icon_toggle, json, pos2, theme, vec2};
+ 
+-pub const TITLE_H: f32 = 38.0;
++pub const TITLE_H: f32 = 40.0;
+ 
+ /// macOS draws the window into the title bar (`with_fullsize_content_view`) and AppKit paints the
+ /// traffic lights itself, 16 pt from the top of the window on macOS 27. Moving them would take
+@@ -31,7 +32,7 @@ pub(super) fn title_geometry(integrated: bool) -> (f32, f32, f32) {
+ /// The window's title row: traffic-light space, quick access, centred title, actions.
+ pub fn title_bar(app: &mut SlideApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
+-    let (height, left, control_h) = title_geometry(app.integrated_titlebar);
++    let (height, left, _control_h) = title_geometry(app.integrated_titlebar);
+     egui::Panel::top("title_bar").exact_size(height).frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
+         let rect = ui.max_rect();
+         // Dragging the empty title bar moves the window.
+@@ -57,39 +58,58 @@ pub fn title_bar(app: &mut SlideApp, ui: &mut Ui) {
+         let title =
+             app.session.active().map(|d| format!("{}{}", d.title(), if dirty { " — Edited" } else { "" })).unwrap_or_else(|| "DeckCraft".into());
+         ui.painter().text(rect.center(), Align2::CENTER_CENTER, title, theme::font(13.0), t.text);
+-        // Right side.
++
++        // Right side (Zone 3).
+         let mut right = ui.new_child(
+             egui::UiBuilder::new()
+-                .max_rect(Rect::from_min_max(pos2(rect.max.x - 320.0, rect.min.y), pos2(rect.max.x - 10.0, rect.max.y)))
++                .max_rect(Rect::from_min_max(pos2(rect.max.x - 760.0, rect.min.y), pos2(rect.max.x - 10.0, rect.max.y)))
+                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
+         );
+-        right.spacing_mut().item_spacing.x = 6.0;
+-        if icon_toggle(&mut right, Icon::Search, "Search commands (⇧⌘P)", true, false).clicked() {
+-            app.palette = Some((String::new(), 0));
+-        }
++        right.spacing_mut().item_spacing.x = 8.0;
++
++        // 1. App Primary Action: Present
+         let share = right.add(
+-            egui::Button::new(egui::RichText::new("  Present  ").color(t.accent_text).font(theme::bold(13.0)))
++            egui::Button::new(egui::RichText::new("  Present  ").color(t.accent_text).font(theme::bold(12.5)))
+                 .fill(t.accent)
+-                .corner_radius(control_h / 2.0)
+-                .min_size(vec2(84.0, control_h)),
++                .corner_radius(6.0)
++                .min_size(vec2(84.0, 28.0)),
+         );
+         if share.clicked() && has_doc {
+             let from = app.session.active().map(|d| d.selection.slide).unwrap_or(0);
+             app.start_show(from, false);
+         }
++
++        // 2. Unified Top-Right Action Bar: ✓ Auto-Save | ● Google Drive: Active (G:) | ✨ AI Agent
++        let drive_active = app.artcraft_drive.is_drive_detected();
++        let proj_name = app.artcraft_drive.active_project_folder_name();
++        let proj_dir = app.artcraft_drive.active_project_dir();
++        crate::artcraft_theme::render_top_right_action_bar(
++            &mut right,
++            &mut app.artcraft_drive.auto_save_enabled,
++            drive_active,
++            &proj_name,
++            &proj_dir,
++            &mut app.artcraft_agent.is_open,
++        );
++
++        // 3. Zone 2 compact search box: 220x28px, 6px radius
++        let (search_r, search_resp) = right.allocate_exact_size(vec2(220.0, 28.0), Sense::click());
++        let bg = if search_resp.hovered() { t.hover } else { t.text_field };
++        right.painter().rect_filled(search_r, 6.0, bg);
++        right.painter().rect_stroke(search_r, 6.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
++        right.painter().text(
++            pos2(search_r.min.x + 8.0, search_r.center().y),
++            Align2::LEFT_CENTER,
++            "🔍 Search commands and help",
++            theme::font(12.0),
++            t.text_dim,
++        );
++        if search_resp.clicked() {
++            app.palette = Some((String::new(), 0));
++        }
++
+         if icon_toggle(&mut right, Icon::CommentsBubble, "Comments", has_doc, app.ui.pane.as_deref() == Some("comments")).clicked() {
+             let _ = app.run("view.pane", json!({"pane": "comments", "toggle": true}));
+         }
+-        if icon_toggle(
+-            &mut right,
+-            if app.ui.brightness == theme::Brightness::Dark { Icon::Sparkle } else { Icon::Palette },
+-            "Light/Dark appearance",
+-            true,
+-            false,
+-        )
+-        .clicked()
+-        {
+-            let _ = app.run("view.dark", json!({}));
+-        }
+     });
+ }
+diff --git a/crates/ui-egui/src/status.rs b/crates/ui-egui/src/status.rs
+index 0301af44..68bf056c 100644
+--- a/crates/ui-egui/src/status.rs
++++ b/crates/ui-egui/src/status.rs
+@@ -14,6 +14,32 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
+     egui::Panel::bottom("status").exact_size(28.0).frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
+         let rect = ui.max_rect();
++        if app.session.active().is_none() || app.backstage.is_some() {
++            let p = ui.painter();
++            p.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, t.border));
++            let left_msg = app.fresh_status().unwrap_or_else(|| "Ready — DeckCraft".to_string());
++            p.text(pos2(rect.min.x + 12.0, rect.center().y), Align2::LEFT_CENTER, &left_msg, theme::font(12.0), t.text_dim);
++            let mut right = ui.new_child(
++                egui::UiBuilder::new()
++                    .max_rect(Rect::from_min_max(pos2(rect.max.x - 220.0, rect.min.y), pos2(rect.max.x - 12.0, rect.max.y)))
++                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
++            );
++            let mut cur_theme = match app.ui.brightness {
++                theme::Brightness::Light => crate::artcraft_theme::AppTheme::Light,
++                theme::Brightness::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++                theme::Brightness::Dark => crate::artcraft_theme::AppTheme::Dark,
++            };
++            if crate::artcraft_theme::render_theme_switcher_dropdown(&mut right, &mut cur_theme) {
++                let new_b = match cur_theme {
++                    crate::artcraft_theme::AppTheme::Light => theme::Brightness::Light,
++                    crate::artcraft_theme::AppTheme::Aurora => theme::Brightness::Aurora,
++                    crate::artcraft_theme::AppTheme::Dark => theme::Brightness::Dark,
++                };
++                app.ui.brightness = new_b;
++                theme::apply_brightness(right.ctx(), new_b);
++            }
++            return;
++        }
+         let Some(st) = app.session.active() else { return };
+         let n = st.doc.slides.len();
+         let left = match st.selection.target {
+@@ -26,7 +52,7 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
+         let sr = p.text(pos2(rect.min.x + 14.0, rect.center().y), Align2::LEFT_CENTER, &left, theme::font(12.0), t.text_dim);
+         shown_text(ui, sr, "status_slide", &left);
+         // Where the controls on the right begin; nothing on the left paints or clicks past it.
+-        let right_x = rect.max.x - 560.0;
++        let right_x = rect.max.x - 680.0;
+         // The selection's proofing language; a click opens Review › Language.
+         let (lang, no_proof) = crate::dialogs::selected_language(app);
+         let name = crate::squiggles::display_lang_name(ui.ctx(), &lang) + if no_proof { " (not checked)" } else { "" };
+@@ -55,6 +81,21 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
+                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
+         );
+         right.spacing_mut().item_spacing.x = 4.0;
++        let mut cur_theme = match app.ui.brightness {
++            theme::Brightness::Light => crate::artcraft_theme::AppTheme::Light,
++            theme::Brightness::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++            theme::Brightness::Dark => crate::artcraft_theme::AppTheme::Dark,
++        };
++        if crate::artcraft_theme::render_theme_switcher_dropdown(&mut right, &mut cur_theme) {
++            let new_b = match cur_theme {
++                crate::artcraft_theme::AppTheme::Light => theme::Brightness::Light,
++                crate::artcraft_theme::AppTheme::Aurora => theme::Brightness::Aurora,
++                crate::artcraft_theme::AppTheme::Dark => theme::Brightness::Dark,
++            };
++            app.ui.brightness = new_b;
++            theme::apply_brightness(right.ctx(), new_b);
++        }
++        right.add_space(8.0);
+         if small_icon(&mut right, Icon::FitSmall, "Fit slide to current window", false).clicked() {
+             app.ui.zoom = None;
+         }
+diff --git a/crates/ui-egui/src/theme.rs b/crates/ui-egui/src/theme.rs
+index 2e14bbaa..04293eb0 100644
+--- a/crates/ui-egui/src/theme.rs
++++ b/crates/ui-egui/src/theme.rs
+@@ -9,6 +9,7 @@ pub enum Brightness {
+     #[default]
+     Light,
+     Dark,
++    Aurora,
+ }
+ 
+ /// Every colour the chrome uses.
+@@ -88,32 +89,32 @@ impl Tokens {
+     pub fn dark() -> Self {
+         Tokens {
+             dark: true,
+-            chrome: Color32::from_rgb(0x26, 0x26, 0x26),
+-            card: Color32::from_rgb(0x33, 0x33, 0x33),
+-            card_border: Color32::from_rgb(0x44, 0x44, 0x44),
+-            text_field: Color32::from_rgb(0x2A, 0x2A, 0x2A),
+-            canvas: Color32::from_rgb(0x1E, 0x1E, 0x1E),
+-            text: Color32::from_rgb(0xEE, 0xEE, 0xEE),
+-            text_dim: Color32::from_rgb(0xBB, 0xBB, 0xBB),
+-            text_faint: Color32::from_rgb(0x88, 0x88, 0x88),
+-            border: Color32::from_rgb(0x4A, 0x4A, 0x4A),
+-            separator: Color32::from_rgb(0x48, 0x48, 0x48),
+-            hover: Color32::from_rgb(0x40, 0x40, 0x40),
+-            pressed: Color32::from_rgb(0x4C, 0x4C, 0x4C),
+-            selected: Color32::from_rgb(0x47, 0x47, 0x47),
++            chrome: Color32::from_rgb(0x18, 0x18, 0x1B),
++            card: Color32::from_rgb(0x20, 0x20, 0x24),
++            card_border: Color32::from_rgb(0x27, 0x27, 0x2A),
++            text_field: Color32::from_rgb(0x20, 0x20, 0x24),
++            canvas: Color32::from_rgb(0x12, 0x12, 0x14),
++            text: Color32::from_rgb(0xED, 0xED, 0xED),
++            text_dim: Color32::from_rgb(0xA1, 0xA1, 0xAA),
++            text_faint: Color32::from_rgb(0x71, 0x71, 0x7A),
++            border: Color32::from_rgb(0x27, 0x27, 0x2A),
++            separator: Color32::from_rgb(0x27, 0x27, 0x2A),
++            hover: Color32::from_rgb(0x27, 0x27, 0x2A),
++            pressed: Color32::from_rgb(0x32, 0x32, 0x38),
++            selected: Color32::from_rgb(0x28, 0x28, 0x30),
+             accent: Color32::from_rgb(0xF2, 0x6B, 0x1D),
+             accent_text: Color32::WHITE,
+             contextual: Color32::from_rgb(0xF5, 0x8A, 0x4B),
+-            selection: Color32::from_rgb(0xAA, 0xAA, 0xAA),
++            selection: Color32::from_rgba_unmultiplied(242, 107, 29, 80),
+             handle_fill: Color32::WHITE,
+-            handle_stroke: Color32::from_rgb(0x6E, 0x6E, 0x6E),
++            handle_stroke: Color32::from_rgb(0x71, 0x71, 0x7A),
+             guide: Color32::from_rgb(0xF2, 0x8A, 0x4B),
+-            caret: Color32::BLACK,
++            caret: Color32::WHITE,
+             text_selection: Color32::from_rgba_unmultiplied(0x5A, 0x8F, 0xE0, 90),
+-            field_bg: Color32::from_rgb(0x2A, 0x2A, 0x2A),
+-            control: Color32::from_rgb(0x2A, 0x2A, 0x2A),
+-            control_hover: Color32::from_rgb(0x40, 0x40, 0x40),
+-            control_pressed: Color32::from_rgb(0x4C, 0x4C, 0x4C),
++            field_bg: Color32::from_rgb(0x20, 0x20, 0x24),
++            control: Color32::from_rgb(0x20, 0x20, 0x24),
++            control_hover: Color32::from_rgb(0x27, 0x27, 0x2A),
++            control_pressed: Color32::from_rgb(0x32, 0x32, 0x38),
+             shadow: Color32::from_black_alpha(90),
+         }
+     }
+@@ -121,13 +122,62 @@ impl Tokens {
+         match b {
+             Brightness::Light => Self::light(),
+             Brightness::Dark => Self::dark(),
++            Brightness::Aurora => Self::aurora(),
+         }
+     }
++
++    pub fn aurora() -> Self {
++        Self {
++            dark: true,
++            chrome: Color32::from_rgb(0x0F, 0x13, 0x22),
++            card: Color32::from_rgb(0x16, 0x1B, 0x30),
++            card_border: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++            text_field: Color32::from_rgb(0x16, 0x1B, 0x30),
++            canvas: Color32::from_rgb(0x09, 0x0B, 0x14),
++            text: Color32::from_rgb(0xF1, 0xF3, 0xF9),
++            text_dim: Color32::from_rgb(0x94, 0xA3, 0xB8),
++            text_faint: Color32::from_rgb(0x64, 0x74, 0x8B),
++            border: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++            separator: Color32::from_rgba_unmultiplied(139, 92, 246, 40),
++            hover: Color32::from_rgb(0x1E, 0x24, 0x40),
++            pressed: Color32::from_rgb(0x28, 0x30, 0x56),
++            selected: Color32::from_rgba_unmultiplied(168, 85, 247, 50),
++            accent: Color32::from_rgb(0xA8, 0x55, 0xF7),
++            accent_text: Color32::WHITE,
++            contextual: Color32::from_rgb(0x38, 0xBD, 0xF8),
++            selection: Color32::from_rgba_unmultiplied(168, 85, 247, 60),
++            handle_fill: Color32::WHITE,
++            handle_stroke: Color32::from_rgb(0x38, 0xBD, 0xF8),
++            guide: Color32::from_rgb(0xEC, 0x48, 0x99),
++            caret: Color32::WHITE,
++            text_selection: Color32::from_rgba_unmultiplied(168, 85, 247, 90),
++            field_bg: Color32::from_rgb(0x16, 0x1B, 0x30),
++            control: Color32::from_rgb(0x16, 0x1B, 0x30),
++            control_hover: Color32::from_rgb(0x1E, 0x24, 0x40),
++            control_pressed: Color32::from_rgb(0x28, 0x30, 0x56),
++            shadow: Color32::from_black_alpha(110),
++        }
++    }
++
+     pub fn get(ctx: &egui::Context) -> Self {
+-        if ctx.global_style().visuals.dark_mode { Self::dark() } else { Self::light() }
++        let is_aurora = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("is_aurora")).unwrap_or(false));
++        if is_aurora {
++            Self::aurora()
++        } else if ctx.global_style().visuals.dark_mode {
++            Self::dark()
++        } else {
++            Self::light()
++        }
+     }
+ }
+ 
++pub fn apply_brightness(ctx: &egui::Context, b: Brightness) {
++    let is_aurora = b == Brightness::Aurora;
++    ctx.data_mut(|d| d.insert_temp(egui::Id::new("is_aurora"), is_aurora));
++    let t = Tokens::for_brightness(b);
++    apply(ctx, &t);
++}
++
+ /// Apply tokens to egui's style.
+ pub fn apply(ctx: &egui::Context, t: &Tokens) {
+     let mut v = if t.dark { Visuals::dark() } else { Visuals::light() };
+@@ -234,6 +284,12 @@ pub fn font_definitions(extra: &[std::sync::Arc<deckcraft_fonts::FontFace>]) ->
+             *d = std::sync::Arc::new(data);
+         }
+     }
++    #[cfg(target_os = "windows")]
++    if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
++        defs.font_data.insert("seguiemj".into(), std::sync::Arc::new(FontData::from_owned(bytes)));
++        defs.families.entry(FontFamily::Proportional).or_default().push("seguiemj".into());
++        defs.families.entry(FontFamily::Monospace).or_default().push("seguiemj".into());
++    }
+     defs
+ }
+ 
